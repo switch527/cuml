@@ -415,6 +415,7 @@ dependencies:
           - libcurand-dev
           - libcusolver-dev
           - libcusparse-dev
+          - libnvjitlink-dev
   cuda_wheels:
     specific:
       # cuML needs 'nvJitLink>={whatever-cuml-was-built-against}' at runtime, and mixing

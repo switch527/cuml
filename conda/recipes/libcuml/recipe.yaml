@@ -82,6 +82,7 @@ cache:
       - libcurand-dev
       - libcusolver-dev
       - libcusparse-dev
+      - libnvjitlink-dev
 
 outputs:
   - package:
@@ -114,6 +115,7 @@ outputs:
         - libcurand
         - libcusolver
         - libcusparse
+        - libnvjitlink
       run:
         - ${{ pin_compatible("cuda-version", upper_bound="x", lower_bound="x") }}
         - cuda-cudart
@@ -122,6 +124,7 @@ outputs:
         - libcurand
         - libcusolver
         - libcusparse
+        - libnvjitlink
         - libcuvs =${{ minor_version }}
         - librmm =${{ minor_version }}
         - rapids-logger =0.2
