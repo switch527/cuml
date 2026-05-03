@@ -116,8 +116,8 @@ outputs:
         - libcurand
         - libcusolver
         - libcusparse
-        - cuda-nvrtc
         - libnvjitlink
+        - cuda-nvrtc
       run:
         - ${{ pin_compatible("cuda-version", upper_bound="x", lower_bound="x") }}
         - cuda-cudart
@@ -126,6 +126,7 @@ outputs:
         - libcurand
         - libcusolver
         - libcusparse
+        - libnvjitlink
         - libcuvs =${{ minor_version }}
         - librmm =${{ minor_version }}
         - rapids-logger =0.2
@@ -141,8 +142,6 @@ outputs:
           - libcufft
           - libcublas
           - libcusolver
-          - cuda-nvrtc
-          - libnvjitlink
     about:
       homepage: ${{ load_from_file("python/libcuml/pyproject.toml").project.urls.Homepage }}
       license: ${{ load_from_file("python/libcuml/pyproject.toml").project.license }}
