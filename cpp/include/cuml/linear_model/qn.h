@@ -8,8 +8,8 @@
 
 #ifdef __cplusplus
 #include <cuml/common/export.hpp>
-namespace ML {
-namespace CUML_EXPORT GLM {
+namespace CUML_EXPORT ML {
+namespace GLM {
 
 extern "C" {
 #endif
@@ -110,6 +110,6 @@ typedef struct qn_params qn_params;
 
 #ifdef __cplusplus
 }
-}  // end namespace CUML_EXPORT GLM
-}  // end namespace ML
+}  // end namespace GLM
+}  // end namespace CUML_EXPORT ML
 #endif

@@ -17,8 +17,8 @@ struct params;
 
 }  // end namespace cuvs::cluster::kmeans
 
-namespace ML {
-namespace CUML_EXPORT kmeans {
+namespace CUML_EXPORT ML {
+namespace kmeans {
 
 struct KMeansParams {
   enum class InitMethod { KMeansPlusPlus, Random, Array };
@@ -37,5 +37,5 @@ struct KMeansParams {
   cuvs::cluster::kmeans::params to_cuvs() const;
 };
 
-}  // end namespace CUML_EXPORT kmeans
-}  // end namespace ML
+}  // end namespace kmeans
+}  // end namespace CUML_EXPORT ML
