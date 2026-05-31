@@ -379,6 +379,8 @@ CUML_KERNEL void adaptive_sample_kernel(int* colids,
   }
 }
 
+// Exactly one of the two companion pointers is non-null per builder; reads
+// are gated on `kIsClassifier` / `kIsRegressor`.
 template <typename DataT,
           typename LabelT,
           typename IdxT,
@@ -386,6 +388,8 @@ template <typename DataT,
           typename ObjectiveT,
           typename BinT>
 void launchComputeSplitKernel(BinT* histograms,
+                              int* unweighted_histograms,
+                              double* weighted_count_histograms,
                               IdxT n_bins,
                               IdxT min_samples_split,
                               IdxT max_leaves,
