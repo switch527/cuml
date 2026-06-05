@@ -66,6 +66,9 @@ __global__ void fill_per_tree_weights_kernel(const LabelT* labels,
   for (int i = tid; i < n_rows; i += stride) {
     int lab   = static_cast<int>(labels[i]);
     int count = counts[lab];
+    // count==0 is the OOB-class case (class absent from this tree's bootstrap).
+    // The 0.0 fallback is safe because the tree builder indexes per_tree_weights
+    // through row_ids, so out-of-bag rows are never read.
     double reciprocal =
       (count > 0) ? (n_sampled / (denom_const * static_cast<double>(count))) : 0.0;
     double base         = base_sample_weight ? static_cast<double>(base_sample_weight[i]) : 1.0;

@@ -122,6 +122,46 @@ class GiniObjectiveFunction {
       out[i] = DataT(shist[i].x) / total;
     }
   }
+
+  // ExtraTrees random-split weighted-Gini gain. n_left / n_parent come from
+  // the unweighted-count companion buffer; caller wraps via sp.update.
+  HDI DataT GainFromSideStats(BinT const* left,
+                              BinT const* parent,
+                              IdxT n_left,
+                              IdxT n_parent) const
+  {
+    IdxT nRight = n_parent - n_left;
+    if (n_left < min_samples_leaf || nRight < min_samples_leaf)
+      return -std::numeric_limits<DataT>::max();
+
+    double W_total = 0.0;
+    double W_left  = 0.0;
+    for (IdxT j = 0; j < nclasses; ++j) {
+      W_total += parent[j].x;
+      W_left += left[j].x;
+    }
+    double W_right = W_total - W_left;
+    if (W_left <= 0.0 || W_right <= 0.0) return -std::numeric_limits<DataT>::max();
+
+    auto invW      = DataT(1.0) / DataT(W_total);
+    auto invWLeft  = DataT(1.0) / DataT(W_left);
+    auto invWRight = DataT(1.0) / DataT(W_right);
+    auto gain      = DataT(0.0);
+
+    for (IdxT j = 0; j < nclasses; ++j) {
+      auto lval      = DataT(left[j].x);
+      auto total_sum = DataT(parent[j].x);
+      auto rval      = total_sum - lval;
+
+      gain += lval * invWLeft * lval * invW;
+      gain += rval * invWRight * rval * invW;
+
+      auto val = total_sum * invW;
+      gain -= val * val;
+    }
+
+    return gain;
+  }
 };
 
 template <typename DataT_, typename LabelT_, typename IdxT_>
@@ -231,7 +271,76 @@ class EntropyObjectiveFunction {
       out[i] = DataT(shist[i].x) / total;
     }
   }
+
+  // ExtraTrees random-split helper; see `GiniObjectiveFunction::GainFromSideStats`
+  // for the companion-buffer convention.
+  HDI DataT GainFromSideStats(BinT const* left,
+                              BinT const* parent,
+                              IdxT n_left,
+                              IdxT n_parent) const
+  {
+    IdxT nRight = n_parent - n_left;
+    if (n_left < min_samples_leaf || nRight < min_samples_leaf)
+      return -std::numeric_limits<DataT>::max();
+
+    double W_total = 0.0;
+    double W_left  = 0.0;
+    for (IdxT j = 0; j < nclasses; ++j) {
+      W_total += parent[j].x;
+      W_left += left[j].x;
+    }
+    double W_right = W_total - W_left;
+    if (W_left <= 0.0 || W_right <= 0.0) return -std::numeric_limits<DataT>::max();
+
+    auto invWLeft  = DataT(1.0) / DataT(W_left);
+    auto invWRight = DataT(1.0) / DataT(W_right);
+    auto invW      = DataT(1.0) / DataT(W_total);
+    auto gain      = DataT(0.0);
+
+    // > 0.0 (not != 0.0): cross-block FP atomicAdd is non-associative, so
+    // left[c].x can exceed parent[c].x by epsilon. raft::log of the
+    // resulting tiny-negative rval poisons the gain with NaN.
+    for (IdxT c = 0; c < nclasses; ++c) {
+      auto lval_i = left[c].x;
+      if (lval_i > 0.0) {
+        auto lval = DataT(lval_i);
+        gain += raft::log(lval * invWLeft) / raft::log(DataT(2)) * lval * invW;
+      }
+
+      auto total_sum = parent[c].x;
+      auto rval_i    = total_sum - lval_i;
+      if (rval_i > 0.0) {
+        auto rval = DataT(rval_i);
+        gain += raft::log(rval * invWRight) / raft::log(DataT(2)) * rval * invW;
+      }
+
+      if (total_sum > 0.0) {
+        auto val = DataT(total_sum) * invW;
+        gain -= val * raft::log(val) / raft::log(DataT(2));
+      }
+    }
+
+    return gain;
+  }
 };
+
+// Shared ExtraTrees adapter for AggregateBin regressor objectives: synthesizes
+// a 2-element histogram so GainPerSplit hits i=0. n_left / n_parent come from
+// AggregateBin.count (unweighted integer row counts) for the min_samples_leaf
+// gate; weights flow through W_left / W_parent.
+template <typename ObjT>
+HDI typename ObjT::DataT et_gain_from_side_stats_regressor(ObjT const& obj,
+                                                           typename ObjT::BinT const* left,
+                                                           typename ObjT::BinT const* parent,
+                                                           double W_left,
+                                                           double W_parent)
+{
+  using IdxT                         = typename ObjT::IdxT;
+  typename ObjT::BinT synthesized[2] = {left[0], parent[0]};
+  IdxT n_left                        = static_cast<IdxT>(left[0].count);
+  IdxT n_parent                      = static_cast<IdxT>(parent[0].count);
+  return obj.GainPerSplit(synthesized, IdxT(0), IdxT(2), n_parent, n_left, W_parent, W_left);
+}
 
 template <typename DataT_, typename LabelT_, typename IdxT_>
 class MSEObjectiveFunction {
@@ -326,6 +435,14 @@ class MSEObjectiveFunction {
     for (int i = 0; i < nclasses; i++) {
       out[i] = DataT(shist[i].label_sum / weighted_total);
     }
+  }
+
+  HDI DataT GainFromSideStats(BinT const* left,
+                              BinT const* parent,
+                              double W_left,
+                              double W_parent) const
+  {
+    return et_gain_from_side_stats_regressor(*this, left, parent, W_left, W_parent);
   }
 };
 
@@ -428,6 +545,14 @@ class PoissonObjectiveFunction {
       out[i] = DataT(shist[i].label_sum / weighted_total);
     }
   }
+
+  HDI DataT GainFromSideStats(BinT const* left,
+                              BinT const* parent,
+                              double W_left,
+                              double W_parent) const
+  {
+    return et_gain_from_side_stats_regressor(*this, left, parent, W_left, W_parent);
+  }
 };
 
 template <typename DataT_, typename LabelT_, typename IdxT_>
@@ -526,6 +651,14 @@ class GammaObjectiveFunction {
       out[i] = DataT(shist[i].label_sum / weighted_total);
     }
   }
+
+  HDI DataT GainFromSideStats(BinT const* left,
+                              BinT const* parent,
+                              double W_left,
+                              double W_parent) const
+  {
+    return et_gain_from_side_stats_regressor(*this, left, parent, W_left, W_parent);
+  }
 };
 
 template <typename DataT_, typename LabelT_, typename IdxT_>
@@ -622,6 +755,14 @@ class InverseGaussianObjectiveFunction {
     for (int i = 0; i < nclasses; i++) {
       out[i] = DataT(shist[i].label_sum / weighted_total);
     }
+  }
+
+  HDI DataT GainFromSideStats(BinT const* left,
+                              BinT const* parent,
+                              double W_left,
+                              double W_parent) const
+  {
+    return et_gain_from_side_stats_regressor(*this, left, parent, W_left, W_parent);
   }
 };
 }  // end namespace DT

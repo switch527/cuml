@@ -699,6 +699,183 @@ TEST(RfTests, ClassifierSampleWeightOnesMatchesNullptr)
   }
 }
 
+// Smoke test for ExtraTrees random-split: SPLITTER_RANDOM fits and produces
+// non-degenerate trees. Accuracy and sklearn-parity live in extratrees_test.cu.
+template <typename DataT>
+static void et_smoke_run(CRITERION criterion, const char* tag)
+{
+  constexpr int m = 500;
+  constexpr int n = 8;
+  thrust::device_vector<DataT> X(m * n);
+  raft::random::Rng r(7);
+  r.normal(X.data().get(), X.size(), DataT(0.0), DataT(1.0), nullptr);
+  std::vector<int> h_y(m);
+  std::mt19937 host_rng(7);
+  for (int i = 0; i < m; ++i)
+    h_y[i] = host_rng() & 1;
+  thrust::device_vector<int> y = h_y;
+
+  auto stream_pool = std::make_shared<rmm::cuda_stream_pool>(1);
+  raft::handle_t handle(rmm::cuda_stream_per_thread, stream_pool);
+  RF_params rf_params = set_rf_params(/*max_depth=*/4,
+                                      /*max_leaves=*/32,
+                                      /*max_features=*/1.0,
+                                      /*max_n_bins=*/32,
+                                      /*min_samples_leaf=*/1,
+                                      /*min_samples_split=*/2,
+                                      /*min_impurity_decrease=*/0.0,
+                                      /*bootstrap=*/false,
+                                      /*n_trees=*/5,
+                                      /*max_samples=*/1.0,
+                                      /*seed=*/42,
+                                      criterion,
+                                      /*cfg_n_streams=*/1,
+                                      /*max_batch_size=*/128,
+                                      DT::SPLITTER_RANDOM);
+
+  auto forest = std::make_shared<RandomForestMetaData<DataT, int>>();
+  fit(handle,
+      forest.get(),
+      X.data().get(),
+      m,
+      n,
+      y.data().get(),
+      2,
+      rf_params,
+      rapids_logger::level_enum::warn);
+
+  ASSERT_EQ(forest->trees.size(), size_t(5)) << tag;
+  for (size_t t = 0; t < forest->trees.size(); ++t) {
+    auto& tree = forest->trees[t];
+    ASSERT_GE(tree->depth_counter, 1) << tag << " tree " << t << " degenerated to root-only";
+    ASSERT_GE(tree->leaf_counter, 2) << tag << " tree " << t << " has only one leaf";
+  }
+}
+
+TEST(RfTests, ExtraTreesClassifierSplitterRandomSmoke)
+{
+  // Exercises all 4 classifier random-split instantiations
+  // (random_{gini,entropy}-{float,double}.cu) so a silent compile defect or
+  // broken accumulation in any one is caught here, not at user-facing call time.
+  et_smoke_run<float>(CRITERION::GINI, "gini-float");
+  et_smoke_run<double>(CRITERION::GINI, "gini-double");
+  et_smoke_run<float>(CRITERION::ENTROPY, "entropy-float");
+  et_smoke_run<double>(CRITERION::ENTROPY, "entropy-double");
+}
+
+// Smoke test for the regressor random-split path; mirrors et_smoke_run for
+// the 8 regressor instantiations.
+template <typename DataT>
+static void et_regressor_smoke_run(CRITERION criterion, const char* tag)
+{
+  constexpr int m = 500;
+  constexpr int n = 8;
+  thrust::device_vector<DataT> X(m * n);
+  raft::random::Rng r(7);
+  r.normal(X.data().get(), X.size(), DataT(0.0), DataT(1.0), nullptr);
+  std::vector<DataT> h_y(m);
+  std::mt19937 host_rng(7);
+  // Poisson / Gamma / InverseGaussian require strictly positive labels;
+  // sample from a positive distribution.
+  std::uniform_real_distribution<double> dist(0.5, 5.0);
+  for (int i = 0; i < m; ++i)
+    h_y[i] = DataT(dist(host_rng));
+  thrust::device_vector<DataT> y = h_y;
+
+  auto stream_pool = std::make_shared<rmm::cuda_stream_pool>(1);
+  raft::handle_t handle(rmm::cuda_stream_per_thread, stream_pool);
+  RF_params rf_params = set_rf_params(/*max_depth=*/4,
+                                      /*max_leaves=*/32,
+                                      /*max_features=*/1.0,
+                                      /*max_n_bins=*/32,
+                                      /*min_samples_leaf=*/1,
+                                      /*min_samples_split=*/2,
+                                      /*min_impurity_decrease=*/0.0,
+                                      /*bootstrap=*/false,
+                                      /*n_trees=*/5,
+                                      /*max_samples=*/1.0,
+                                      /*seed=*/42,
+                                      criterion,
+                                      /*cfg_n_streams=*/1,
+                                      /*max_batch_size=*/128,
+                                      DT::SPLITTER_RANDOM);
+
+  auto forest = std::make_shared<RandomForestMetaData<DataT, DataT>>();
+  fit(handle,
+      forest.get(),
+      X.data().get(),
+      m,
+      n,
+      y.data().get(),
+      rf_params,
+      rapids_logger::level_enum::warn);
+
+  ASSERT_EQ(forest->trees.size(), size_t(5)) << tag;
+  for (size_t t = 0; t < forest->trees.size(); ++t) {
+    auto& tree = forest->trees[t];
+    ASSERT_GE(tree->depth_counter, 1) << tag << " tree " << t << " degenerated to root-only";
+    ASSERT_GE(tree->leaf_counter, 2) << tag << " tree " << t << " has only one leaf";
+  }
+}
+
+TEST(RfTests, ExtraTreesRegressorSplitterRandomSmoke)
+{
+  // Exercises all 8 regressor random-split instantiations
+  // (random_{mse,poisson,gamma,inverse_gaussian}-{float,double}.cu).
+  et_regressor_smoke_run<float>(CRITERION::MSE, "mse-float");
+  et_regressor_smoke_run<double>(CRITERION::MSE, "mse-double");
+  et_regressor_smoke_run<float>(CRITERION::POISSON, "poisson-float");
+  et_regressor_smoke_run<double>(CRITERION::POISSON, "poisson-double");
+  et_regressor_smoke_run<float>(CRITERION::GAMMA, "gamma-float");
+  et_regressor_smoke_run<double>(CRITERION::GAMMA, "gamma-double");
+  et_regressor_smoke_run<float>(CRITERION::INVERSE_GAUSSIAN, "inverse_gaussian-float");
+  et_regressor_smoke_run<double>(CRITERION::INVERSE_GAUSSIAN, "inverse_gaussian-double");
+}
+
+// SPLITTER_RANDOM requires max_n_bins >= 2 since et_split_position draws from
+// [0, n_bins - 1). validity_check fires at set_rf_params time so the error
+// surfaces before fit's OpenMP region (where exceptions can't propagate).
+TEST(RfTests, ExtraTreesClassifierMaxNBinsBelowTwoAsserts)
+{
+  EXPECT_THROW(set_rf_params(/*max_depth=*/4,
+                             /*max_leaves=*/-1,
+                             /*max_features=*/1.0,
+                             /*max_n_bins=*/1,  // violates SPLITTER_RANDOM precondition
+                             /*min_samples_leaf=*/1,
+                             /*min_samples_split=*/2,
+                             /*min_impurity_decrease=*/0.0,
+                             /*bootstrap=*/false,
+                             /*n_trees=*/1,
+                             /*max_samples=*/1.0,
+                             /*seed=*/42,
+                             CRITERION::GINI,
+                             /*cfg_n_streams=*/1,
+                             /*max_batch_size=*/128,
+                             DT::SPLITTER_RANDOM),
+               raft::exception);
+}
+
+// Same precondition applies on the regressor path.
+TEST(RfTests, ExtraTreesRegressorMaxNBinsBelowTwoAsserts)
+{
+  EXPECT_THROW(set_rf_params(/*max_depth=*/4,
+                             /*max_leaves=*/-1,
+                             /*max_features=*/1.0,
+                             /*max_n_bins=*/1,
+                             /*min_samples_leaf=*/1,
+                             /*min_samples_split=*/2,
+                             /*min_impurity_decrease=*/0.0,
+                             /*bootstrap=*/false,
+                             /*n_trees=*/1,
+                             /*max_samples=*/1.0,
+                             /*seed=*/42,
+                             CRITERION::MSE,
+                             /*cfg_n_streams=*/1,
+                             /*max_batch_size=*/128,
+                             DT::SPLITTER_RANDOM),
+               raft::exception);
+}
+
 // Unit-weight invariance: regressor fit with `sample_weight = 1.0` matches
 // the `nullptr` path byte-for-byte.
 TEST(RfTests, RegressorSampleWeightOnesMatchesNullptr)

@@ -36,6 +36,12 @@ from cuml.internals.treelite cimport (
 )
 
 
+cdef extern from "cuml/tree/decisiontree.hpp" namespace "ML::DT" nogil:
+    cdef enum Splitter:
+        SPLITTER_BEST,
+        SPLITTER_RANDOM
+
+
 cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
     cdef enum CRITERION:
         GINI,
@@ -64,7 +70,8 @@ cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
         uint64_t seed,
         CRITERION split_criterion,
         int cfg_n_streams,
-        int max_batch_size
+        int max_batch_size,
+        Splitter cfg_splitter,
     ) except +
 
     cdef void fit_treelite[T, L](
@@ -135,6 +142,11 @@ _split_criterion_to_criterion = {
     4: "poisson",
 }
 
+_splitter_lookup = {
+    "best": SPLITTER_BEST,
+    "random": SPLITTER_RANDOM,
+}
+
 
 def _normalize_split_criterion(split_criterion):
     if (out := _split_criterion_lookup.get(str(split_criterion))) is None:
@@ -176,6 +188,10 @@ _DEPRECATED_MAX_DEPTH_DEFAULT = "deprecated"
 
 
 class BaseRandomForestModel(Base, InteropMixin):
+
+    # Splitter selection. Subclasses set this to "random" to route through
+    # the SPLITTER_RANDOM C++ path (used by ExtraTreesClassifier/Regressor).
+    _splitter = "best"
 
     @classmethod
     def _get_param_names(cls):
@@ -554,6 +570,14 @@ class BaseRandomForestModel(Base, InteropMixin):
         else:
             n_bins = self.n_bins
 
+        if (cfg_splitter_py := _splitter_lookup.get(self._splitter)) is None:
+            raise ValueError(
+                f"Unknown splitter value {self._splitter!r} on "
+                f"{type(self).__name__}; expected one of "
+                f"{sorted(_splitter_lookup)}"
+            )
+        cdef Splitter cfg_splitter = <Splitter> cfg_splitter_py
+
         cdef RF_params params = set_rf_params(
             max_depth_c,
             self.max_leaves,
@@ -569,6 +593,7 @@ class BaseRandomForestModel(Base, InteropMixin):
             _normalize_split_criterion(self.split_criterion),
             self.n_streams,
             self.max_batch_size,
+            cfg_splitter,
         )
 
         cdef TreeliteModelHandle tl_handle

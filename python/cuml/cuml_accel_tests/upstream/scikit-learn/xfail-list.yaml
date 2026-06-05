@@ -182,7 +182,16 @@
   - "sklearn.decomposition.tests.test_pca::test_sparse_pca_solver_error[42-csr_matrix-full]"
   - "sklearn.decomposition.tests.test_pca::test_sparse_pca_solver_error[42-csr_matrix-randomized]"
   - "sklearn.ensemble.tests.test_forest::test_backend_respected"
+  - "sklearn.ensemble.tests.test_forest::test_class_weights[ExtraTreesClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_class_weights[RandomForestClassifier]"
+  - "sklearn.ensemble.tests.test_forest::test_estimators_samples[ExtraTreesClassifier-False-1]"
+  - "sklearn.ensemble.tests.test_forest::test_estimators_samples[ExtraTreesClassifier-False-None]"
+  - "sklearn.ensemble.tests.test_forest::test_estimators_samples[ExtraTreesClassifier-True-1]"
+  - "sklearn.ensemble.tests.test_forest::test_estimators_samples[ExtraTreesClassifier-True-None]"
+  - "sklearn.ensemble.tests.test_forest::test_estimators_samples[ExtraTreesRegressor-False-1]"
+  - "sklearn.ensemble.tests.test_forest::test_estimators_samples[ExtraTreesRegressor-False-None]"
+  - "sklearn.ensemble.tests.test_forest::test_estimators_samples[ExtraTreesRegressor-True-1]"
+  - "sklearn.ensemble.tests.test_forest::test_estimators_samples[ExtraTreesRegressor-True-None]"
   - "sklearn.ensemble.tests.test_forest::test_estimators_samples[RandomForestClassifier-False-1]"
   - "sklearn.ensemble.tests.test_forest::test_estimators_samples[RandomForestClassifier-False-None]"
   - "sklearn.ensemble.tests.test_forest::test_estimators_samples[RandomForestClassifier-True-1]"
@@ -194,24 +203,41 @@
   - "sklearn.ensemble.tests.test_forest::test_forest_feature_importances_sum"
   - "sklearn.ensemble.tests.test_forest::test_forest_y_sparse[csr_array]"
   - "sklearn.ensemble.tests.test_forest::test_forest_y_sparse[csr_matrix]"
+  - "sklearn.ensemble.tests.test_forest::test_importances[ExtraTreesClassifier-gini-float32]"
+  - "sklearn.ensemble.tests.test_forest::test_importances[ExtraTreesClassifier-gini-float64]"
+  - "sklearn.ensemble.tests.test_forest::test_importances[ExtraTreesRegressor-squared_error-float32]"
+  - "sklearn.ensemble.tests.test_forest::test_importances[ExtraTreesRegressor-squared_error-float64]"
   - "sklearn.ensemble.tests.test_forest::test_importances[RandomForestClassifier-gini-float32]"
   - "sklearn.ensemble.tests.test_forest::test_importances[RandomForestClassifier-gini-float64]"
   - "sklearn.ensemble.tests.test_forest::test_importances[RandomForestRegressor-squared_error-float32]"
   - "sklearn.ensemble.tests.test_forest::test_importances[RandomForestRegressor-squared_error-float64]"
+  - "sklearn.ensemble.tests.test_forest::test_max_leaf_nodes_max_depth[ExtraTreesClassifier]"
+  - "sklearn.ensemble.tests.test_forest::test_max_leaf_nodes_max_depth[ExtraTreesRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_max_leaf_nodes_max_depth[RandomForestClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_max_leaf_nodes_max_depth[RandomForestRegressor]"
+  - "sklearn.ensemble.tests.test_forest::test_max_samples_bootstrap[ExtraTreesClassifier]"
+  - "sklearn.ensemble.tests.test_forest::test_max_samples_bootstrap[ExtraTreesRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_max_samples_bootstrap[RandomForestClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_max_samples_bootstrap[RandomForestRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_min_impurity_decrease"
+  - "sklearn.ensemble.tests.test_forest::test_min_samples_leaf[ExtraTreesClassifier]"
+  - "sklearn.ensemble.tests.test_forest::test_min_samples_leaf[ExtraTreesRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_min_samples_leaf[RandomForestClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_min_samples_leaf[RandomForestRegressor]"
+  - "sklearn.ensemble.tests.test_forest::test_min_samples_split[ExtraTreesClassifier]"
+  - "sklearn.ensemble.tests.test_forest::test_min_samples_split[ExtraTreesRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_min_samples_split[RandomForestClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_min_samples_split[RandomForestRegressor]"
+  - "sklearn.ensemble.tests.test_forest::test_oob_not_computed_twice[ExtraTreesClassifier]"
+  - "sklearn.ensemble.tests.test_forest::test_oob_not_computed_twice[ExtraTreesRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_oob_not_computed_twice[RandomForestClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_oob_not_computed_twice[RandomForestRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_poisson_y_positive_check"
+  - "sklearn.ensemble.tests.test_forest::test_warm_start[ExtraTreesClassifier]"
+  - "sklearn.ensemble.tests.test_forest::test_warm_start[ExtraTreesRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_warm_start[RandomForestClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_warm_start[RandomForestRegressor]"
+  - "sklearn.ensemble.tests.test_forest::test_warm_start_oob[ExtraTreesRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_warm_start_oob[RandomForestRegressor]"
   - "sklearn.ensemble.tests.test_voting::test_predict_on_toy_problem[42]"
   - "sklearn.ensemble.tests.test_voting::test_sample_weight[42]"
@@ -737,7 +763,9 @@
   - "sklearn.cluster.tests.test_k_means::test_score_max_iter[42-KMeans]"
   - "sklearn.decomposition.tests.test_truncated_svd::test_explained_variance_components_10_20[arpack-sparse]"
   - "sklearn.decomposition.tests.test_truncated_svd::test_explained_variance_components_10_20[randomized-sparse]"
+  - "sklearn.ensemble.tests.test_forest::test_max_samples_boundary_regressors[ExtraTreesRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_max_samples_boundary_regressors[RandomForestRegressor]"
+  - "sklearn.ensemble.tests.test_forest::test_warm_start_oob[ExtraTreesClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_warm_start_oob[RandomForestClassifier]"
   - "sklearn.ensemble.tests.test_stacking::test_stacking_cv_influence[StackingClassifier]"
   - "sklearn.ensemble.tests.test_voting::test_parallel_fit[42]"
@@ -876,13 +904,17 @@
 - reason: Multi-output targets not supported
   marker: cuml_accel_rf_multioutput_targets_not_supported
   tests:
+  - "sklearn.ensemble.tests.test_forest::test_forest_classifier_oob[True-X3-y3-0.18-array-ExtraTreesClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_forest_classifier_oob[True-X3-y3-0.18-array-RandomForestClassifier]"
 - reason: OOB score accuracy slightly below sklearn
   marker: cuml_accel_rf_oob_score_accuracy
   strict: false
   tests:
+  - "sklearn.ensemble.tests.test_forest::test_forest_classifier_oob[True-X2-y2-0.65-array-ExtraTreesClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_forest_classifier_oob[True-X2-y2-0.65-array-RandomForestClassifier]"
+  - "sklearn.ensemble.tests.test_forest::test_forest_classifier_oob[oob_score1-X2-y2-0.65-array-ExtraTreesClassifier]"
   - "sklearn.ensemble.tests.test_forest::test_forest_classifier_oob[oob_score1-X2-y2-0.65-array-RandomForestClassifier]"
+  - "sklearn.ensemble.tests.test_forest::test_forest_regressor_oob[True-X0-y0-0.7-array-ExtraTreesRegressor]"
   - "sklearn.ensemble.tests.test_forest::test_forest_regressor_oob[True-X0-y0-0.7-array-RandomForestRegressor]"
 - reason: These tests sometimes fail due to new deprecation warnings in SciPy 1.16
   marker: cuml_accel_scipy_1_16
@@ -927,6 +959,10 @@
   marker: cuml_accel_test_estimators
   condition: scikit-learn>=1.6
   tests:
+  - "sklearn.tests.test_common::test_estimators[ExtraTreesClassifier()-check_sample_weight_equivalence_on_dense_data]"
+  - "sklearn.tests.test_common::test_estimators[ExtraTreesClassifier()-check_sample_weight_equivalence_on_sparse_data]"
+  - "sklearn.tests.test_common::test_estimators[ExtraTreesRegressor()-check_sample_weight_equivalence_on_dense_data]"
+  - "sklearn.tests.test_common::test_estimators[ExtraTreesRegressor()-check_sample_weight_equivalence_on_sparse_data]"
   - "sklearn.tests.test_common::test_estimators[RandomForestClassifier()-check_sample_weight_equivalence_on_dense_data]"
   - "sklearn.tests.test_common::test_estimators[RandomForestClassifier()-check_sample_weight_equivalence_on_sparse_data]"
   - "sklearn.tests.test_common::test_estimators[RandomForestRegressor()-check_sample_weight_equivalence_on_dense_data]"
@@ -940,6 +976,10 @@
 - reason: test_estimators checks fail
   marker: cuml_accel_test_estimators
   tests:
+  - "sklearn.tests.test_common::test_estimators[ExtraTreesClassifier()-check_classifiers_multilabel_output_format_decision_function]"
+  - "sklearn.tests.test_common::test_estimators[ExtraTreesClassifier()-check_fit2d_1sample]"
+  - "sklearn.tests.test_common::test_estimators[ExtraTreesRegressor()-check_fit2d_1sample]"
+  - "sklearn.tests.test_common::test_estimators[ExtraTreesRegressor()-check_regressor_data_not_an_array]"
   - "sklearn.tests.test_common::test_estimators[KNeighborsRegressor()-check_supervised_y_no_nan]"
   - "sklearn.tests.test_common::test_estimators[PCA()-check_fit2d_1feature]"
   - "sklearn.tests.test_common::test_estimators[PCA()-check_fit2d_1sample]"

@@ -233,6 +233,9 @@ struct Builder {
     ASSERT(q.quantiles_array != nullptr && q.n_bins_array != nullptr,
            "Currently quantiles need to be computed before this call!");
     ASSERT(n_classes >= 1, "n_classes should be at least 1");
+    // SPLITTER_RANDOM + max_n_bins < 2 is rejected at validity_check time
+    // (decisiontree.cu); not re-checked here since Builder runs inside fit's
+    // OpenMP region where a fired ASSERT would terminate rather than throw.
 
     auto [device_workspace_size, host_workspace_size] = workspaceSize();
     d_buff.resize(device_workspace_size, builder_stream);
@@ -276,12 +279,15 @@ struct Builder {
     size_t d_wsize = 0, h_wsize = 0;
     raft::common::nvtx::range fun_scope("Builder::workspaceSize @builder.cuh [batched-levelalgo]");
     auto max_batch = params.max_batch_size;
-    size_t max_len_histograms =
-      max_batch * params.max_n_bins * n_blks_for_cols * dataset.num_outputs;
+    // ET reuses the existing histograms + companion pointers with shape
+    // collapsed from max_n_bins to 2 (left + parent per (node, feature)).
+    size_t per_block_bins =
+      (params.splitter == SPLITTER_RANDOM) ? size_t(2) : size_t(params.max_n_bins);
+    size_t max_len_histograms = max_batch * per_block_bins * n_blks_for_cols * dataset.num_outputs;
 
     d_wsize += calculateAlignedBytes(sizeof(IdxT));                       // n_nodes
     d_wsize += calculateAlignedBytes(sizeof(BinT) * max_len_histograms);  // histograms
-    size_t max_len_companion = max_batch * params.max_n_bins * n_blks_for_cols;
+    size_t max_len_companion = max_batch * per_block_bins * n_blks_for_cols;
     if constexpr (kIsClassifier) {
       d_wsize += calculateAlignedBytes(sizeof(int) * max_len_companion);  // unweighted_histograms
     } else if constexpr (kIsRegressor) {
@@ -317,14 +323,15 @@ struct Builder {
       "Builder::assignWorkspace @builder.cuh [batched-levelalgo]");
     auto max_batch  = params.max_batch_size;
     auto n_col_blks = n_blks_for_cols;
-    size_t max_len_histograms =
-      max_batch * (params.max_n_bins) * n_blks_for_cols * dataset.num_outputs;
+    size_t per_block_bins =
+      (params.splitter == SPLITTER_RANDOM) ? size_t(2) : size_t(params.max_n_bins);
+    size_t max_len_histograms = max_batch * per_block_bins * n_blks_for_cols * dataset.num_outputs;
     // device
     n_nodes = reinterpret_cast<IdxT*>(d_wspace);
     d_wspace += calculateAlignedBytes(sizeof(IdxT));
     histograms = reinterpret_cast<BinT*>(d_wspace);
     d_wspace += calculateAlignedBytes(sizeof(BinT) * max_len_histograms);
-    size_t max_len_companion = max_batch * (params.max_n_bins) * n_blks_for_cols;
+    size_t max_len_companion = max_batch * per_block_bins * n_blks_for_cols;
     if constexpr (kIsClassifier) {
       unweighted_histograms = reinterpret_cast<int*>(d_wspace);
       d_wspace += calculateAlignedBytes(sizeof(int) * max_len_companion);
@@ -514,17 +521,34 @@ struct Builder {
 
   auto computeSplitSmemSize()
   {
-    size_t smem_size_1 =
-      params.max_n_bins * dataset.num_outputs * sizeof(BinT) +  // shared_histogram
-      params.max_n_bins * sizeof(DataT) +                       // shared_quantiles
-      sizeof(int);                                              // shared_done
-    int n_align_slots = 3;  // shared_histogram, shared_quantiles, shared_done
-    if constexpr (kIsClassifier) {
-      smem_size_1 += params.max_n_bins * sizeof(int);  // shared_unweighted
-      n_align_slots = 4;
-    } else if constexpr (kIsRegressor) {
-      smem_size_1 += params.max_n_bins * sizeof(double);  // shared_weighted_count
-      n_align_slots = 4;
+    size_t smem_size_1;
+    int n_align_slots;
+    if (params.splitter == SPLITTER_RANDOM) {
+      // ET kernel: 2 BinT arrays (shared_left + shared_parent), each of size
+      // num_outputs, plus one companion cell per side. No shared_quantiles
+      // (single global-memory read).
+      smem_size_1 = size_t(2) * dataset.num_outputs * sizeof(BinT)  // shared_left+shared_parent
+                    + sizeof(int);                                  // shared_done
+      // 5 alignPointer calls in the kernel: left, parent, companion_left,
+      // companion_parent, done. Match the kernel's actual advance count.
+      n_align_slots = 5;
+      if constexpr (kIsClassifier) {
+        smem_size_1 += size_t(2) * sizeof(int);  // shared_companion_left + parent
+      } else if constexpr (kIsRegressor) {
+        smem_size_1 += size_t(2) * sizeof(double);
+      }
+    } else {
+      smem_size_1 = params.max_n_bins * dataset.num_outputs * sizeof(BinT) +  // shared_histogram
+                    params.max_n_bins * sizeof(DataT) +                       // shared_quantiles
+                    sizeof(int);                                              // shared_done
+      n_align_slots = 3;  // shared_histogram, shared_quantiles, shared_done
+      if constexpr (kIsClassifier) {
+        smem_size_1 += params.max_n_bins * sizeof(int);  // shared_unweighted
+        n_align_slots = 4;
+      } else if constexpr (kIsRegressor) {
+        smem_size_1 += params.max_n_bins * sizeof(double);  // shared_weighted_count
+        n_align_slots = 4;
+      }
     }
     // Worst-case alignPointer slack per slot is sizeof(largest-following-type)-1.
     // The regressor companion is double-aligned, so use 8 bytes per slot.
@@ -543,17 +567,20 @@ struct Builder {
     // if no instances to split, return
     if (n_blocks_dimx == 0) return;
     raft::common::nvtx::range fun_scope("Builder::computeSplit @builder.cuh [batched-levelalgo]");
-    auto n_bins    = params.max_n_bins;
     auto n_classes = dataset.num_outputs;
+    int per_block_bins =
+      (params.splitter == SPLITTER_RANDOM) ? 2 : static_cast<int>(params.max_n_bins);
     // if columns left to be processed lesser than `n_blks_for_cols`, shrink the blocks along dimy
     auto n_blocks_dimy = std::min(n_blks_for_cols, dataset.n_sampled_cols - col);
     // compute required dynamic shared memory
     auto smem_size = computeSplitSmemSize();
     dim3 grid(n_blocks_dimx, n_blocks_dimy, 1);
     // required total length (in bins) of the global segmented histograms over all
-    // classes, features and (large)nodes.
-    int len_histograms = n_bins * n_classes * n_blocks_dimy * n_large_nodes;
-    int len_companion  = n_bins * n_blocks_dimy * n_large_nodes;
+    // classes, features and (large)nodes. Invariant: n_large_nodes <= max_batch
+    // and n_blocks_dimy <= n_blks_for_cols, so the memset always fits within
+    // the workspace sized to (max_batch * per_block_bins * n_blks_for_cols).
+    int len_histograms = per_block_bins * n_classes * n_blocks_dimy * n_large_nodes;
+    int len_companion  = per_block_bins * n_blocks_dimy * n_large_nodes;
     RAFT_CUDA_TRY(cudaMemsetAsync(histograms, 0, sizeof(BinT) * len_histograms, builder_stream));
     if constexpr (kIsClassifier) {
       RAFT_CUDA_TRY(
@@ -564,7 +591,36 @@ struct Builder {
     }
     // create the objective function object
     ObjectiveT objective(dataset.num_outputs, params.min_samples_leaf);
-    // call the computeSplitKernel
+
+    if (params.splitter == SPLITTER_RANDOM) {
+      // Both classifier and regressor instantiations of randomSplitKernel
+      // are in the build, so the launch is unconditional under either BinT.
+      raft::common::nvtx::range kernel_scope("randomSplitKernel @builder.cuh [batched-levelalgo]");
+      launchRandomSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(histograms,
+                                                                unweighted_histograms,
+                                                                weighted_count_histograms,
+                                                                params.max_n_bins,
+                                                                params.min_samples_split,
+                                                                params.max_leaves,
+                                                                dataset,
+                                                                quantiles,
+                                                                d_work_items,
+                                                                col,
+                                                                colids,
+                                                                done_count,
+                                                                mutex,
+                                                                splits,
+                                                                objective,
+                                                                treeid,
+                                                                workload_info,
+                                                                seed,
+                                                                grid,
+                                                                smem_size,
+                                                                builder_stream);
+      return;
+    }
+
+    // SPLITTER_BEST: existing deterministic path
     raft::common::nvtx::range kernel_scope("computeSplitKernel @builder.cuh [batched-levelalgo]");
     launchComputeSplitKernel<DataT, LabelT, IdxT, TPB_DEFAULT>(histograms,
                                                                unweighted_histograms,

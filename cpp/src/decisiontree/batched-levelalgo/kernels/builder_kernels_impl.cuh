@@ -149,7 +149,9 @@ static __global__ void leafKernel(ObjectiveT objective,
   __syncthreads();
   bool has_weight = (dataset.sample_weight != nullptr);
   for (auto i = range.begin + tid; i < range.begin + range.count; i += blockDim.x) {
-    auto row      = dataset.row_ids[i];
+    auto row = dataset.row_ids[i];
+    // INVARIANT: row is a valid index into dataset.sample_weight; the
+    // per_tree_weights silent-zero (per_tree_weights.cu) is unreachable here.
     auto label    = dataset.labels[row];
     double weight = has_weight ? static_cast<double>(dataset.sample_weight[row]) : 1.0;
     BinT::IncrementHistogram(histogram, 1, 0, label, weight);
@@ -301,7 +303,9 @@ static __global__ void computeSplitKernel(BinT* histograms,
   std::size_t col_offset = std::size_t(col) * dataset.M;
   for (auto i = range_start + tid; i < end; i += stride) {
     // each thread works over a data point and strides to the next
-    auto row      = dataset.row_ids[i];
+    auto row = dataset.row_ids[i];
+    // INVARIANT: row is a valid index into dataset.sample_weight; the
+    // per_tree_weights silent-zero (per_tree_weights.cu) is unreachable here.
     auto data     = dataset.data[row + col_offset];
     auto label    = dataset.labels[row];
     double weight = has_weight ? static_cast<double>(dataset.sample_weight[row]) : 1.0;

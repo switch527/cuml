@@ -8,7 +8,12 @@ from cuml.accel.estimator_proxy import ProxyBase
 from cuml.internals.interop import UnsupportedOnGPU
 from cuml.internals.validation import check_array
 
-__all__ = ("RandomForestRegressor", "RandomForestClassifier")
+__all__ = (
+    "ExtraTreesClassifier",
+    "ExtraTreesRegressor",
+    "RandomForestClassifier",
+    "RandomForestRegressor",
+)
 
 
 class _RandomForestMixin:
@@ -88,3 +93,11 @@ class RandomForestClassifier(ProxyBase, _RandomForestMixin):
 
     def __getitem__(self, index):
         return self._call_method("__getitem__", index)
+
+
+class ExtraTreesClassifier(RandomForestClassifier):
+    _gpu_class = cuml.ensemble.ExtraTreesClassifier
+
+
+class ExtraTreesRegressor(RandomForestRegressor):
+    _gpu_class = cuml.ensemble.ExtraTreesRegressor

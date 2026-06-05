@@ -867,6 +867,79 @@ def test_random_forest_classifier(
     assert cu_model2.score(X, y) > 0.7
 
 
+@pytest.mark.parametrize(
+    "class_weight",
+    [None, "balanced", "balanced_subsample", {0: 1.0, 1: 2.0}],
+)
+@pytest.mark.parametrize("bootstrap", [True, False])
+@pytest.mark.parametrize("oob_score", [False, True])
+def test_extra_trees_classifier(
+    random_state, oob_score, bootstrap, class_weight
+):
+    X, y = make_classification(
+        n_samples=200, n_features=5, n_informative=3, random_state=random_state
+    )
+
+    # OOB needs bootstrap; with bootstrap=False, balanced_subsample
+    # silently collapses to 'balanced' on both cuml and sklearn.
+    effective_oob = oob_score and bootstrap
+
+    cu_model = cuml.ExtraTreesClassifier(
+        oob_score=effective_oob,
+        max_depth=None,
+        bootstrap=bootstrap,
+        class_weight=class_weight,
+    ).fit(X, y)
+    sk_model = sklearn.ensemble.ExtraTreesClassifier(
+        oob_score=effective_oob,
+        max_depth=None,
+        bootstrap=bootstrap,
+        class_weight=class_weight,
+    ).fit(X, y)
+
+    sk_model2 = cu_model.as_sklearn()
+    cu_model2 = cuml.ExtraTreesClassifier.from_sklearn(sk_model)
+
+    assert isinstance(sk_model2, sklearn.ensemble.ExtraTreesClassifier)
+    assert isinstance(sk_model2.classes_, np.ndarray)
+    assert isinstance(cu_model2.classes_, np.ndarray)
+    assert (sk_model2.classes_ == cu_model2.classes_).all()
+    # _splitter is a class attribute, skipped by clone()/get_params(); pin
+    # it so a future subclass refactor can't silently route ETC predictions
+    # through the RFC kernel path.
+    assert cu_model2._splitter == "random"
+
+    # sample_weight is a fit-time arg, not a constructor parameter, so the
+    # get_params() / clone() round-trip checked here does not apply to it.
+    assert_roundtrip_consistency(
+        cu_model,
+        cu_model2,
+        exclude=("classes_", "feature_importances_", "class_weight_"),
+    )
+
+    if effective_oob:
+        assert hasattr(cu_model, "oob_score_")
+        assert hasattr(cu_model2, "oob_score_")
+        assert hasattr(sk_model2, "oob_score_")
+        assert cu_model.oob_score_ == sk_model2.oob_score_
+        assert cu_model2.oob_score_ == sk_model.oob_score_
+
+    # 0.7 floor against treelite-export information loss, not a tight parity
+    # bound. Observed scores are ~0.95-0.99 across all parametrizations.
+    assert sk_model2.score(X, y) > 0.7
+    assert cu_model2.score(X, y) > 0.7
+    # Tight treelite round-trip pin: sk_model2 is cu_model.as_sklearn(), so
+    # both calls hit the same trees. Observed delta < 0.005; 0.02 absorbs
+    # fp32-export rounding.
+    assert abs(cu_model.score(X, y) - sk_model2.score(X, y)) < 0.02
+
+    cu_model2.fit(X, y)
+    sk_model2.fit(X, y)
+
+    assert sk_model2.score(X, y) > 0.7
+    assert cu_model2.score(X, y) > 0.7
+
+
 @pytest.mark.parametrize("oob_score", [False, True])
 def test_random_forest_regressor(random_state, oob_score):
     X, y = make_regression(n_samples=200, random_state=random_state)
@@ -910,6 +983,62 @@ def test_random_forest_regressor(random_state, oob_score):
     # Refit models have similar results
     assert sk_model2.score(X, y) > 0.7
     assert cu_model2.score(X, y) > 0.7
+
+
+@pytest.mark.parametrize("bootstrap", [True, False])
+@pytest.mark.parametrize("oob_score", [False, True])
+def test_extra_trees_regressor(random_state, oob_score, bootstrap):
+    X, y = make_regression(n_samples=200, random_state=random_state)
+    X = X.astype("float32")
+
+    # OOB needs bootstrap; class_weight does not apply to regressors.
+    effective_oob = oob_score and bootstrap
+
+    cu_model = cuml.ExtraTreesRegressor(
+        oob_score=effective_oob,
+        max_depth=None,
+        bootstrap=bootstrap,
+    ).fit(X, y)
+    sk_model = sklearn.ensemble.ExtraTreesRegressor(
+        oob_score=effective_oob,
+        max_depth=None,
+        bootstrap=bootstrap,
+    ).fit(X, y)
+
+    sk_model2 = cu_model.as_sklearn()
+    cu_model2 = cuml.ExtraTreesRegressor.from_sklearn(sk_model)
+
+    assert isinstance(sk_model2, sklearn.ensemble.ExtraTreesRegressor)
+    assert isinstance(cu_model2, cuml.ExtraTreesRegressor)
+    # Regressor side of the _splitter pin; see ETC test above for rationale.
+    assert cu_model2._splitter == "random"
+
+    # sample_weight is a fit-time arg, not a constructor parameter, so the
+    # get_params() / clone() round-trip checked here does not apply to it.
+    assert_roundtrip_consistency(
+        cu_model, cu_model2, exclude=("feature_importances_",)
+    )
+
+    if effective_oob:
+        assert hasattr(cu_model, "oob_score_")
+        assert hasattr(cu_model2, "oob_score_")
+        assert hasattr(sk_model2, "oob_score_")
+        assert cu_model.oob_score_ == sk_model2.oob_score_
+        assert cu_model2.oob_score_ == sk_model.oob_score_
+
+    # 0.5 floor against treelite-export information loss, not tight parity.
+    # Observed scores ~0.85-0.95 across parametrizations.
+    assert sk_model2.score(X, y) > 0.5
+    assert cu_model2.score(X, y) > 0.5
+    # Regressor side of the treelite round-trip pin; observed delta < 0.005;
+    # 0.02 absorbs fp32-export rounding on R².
+    assert abs(cu_model.score(X, y) - sk_model2.score(X, y)) < 0.02
+
+    cu_model2.fit(X, y)
+    sk_model2.fit(X, y)
+
+    assert sk_model2.score(X, y) > 0.5
+    assert cu_model2.score(X, y) > 0.5
 
 
 @pytest.mark.parametrize("prediction_data", [False, True])

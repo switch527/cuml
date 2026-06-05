@@ -231,8 +231,9 @@ cdef class TreeExplainer:
         Returns
         -------
         array
-            Returns a matrix of SHAP values of shape
-            (# classes x # samples x # features).
+            For regressors and single-class outputs, shape is
+            (# samples, # features). For multi-class classifiers, shape is
+            (# samples, # features, # classes).
         """
         return_numpy = _is_host_container(X)
         X = check_array(

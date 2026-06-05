@@ -395,5 +395,63 @@ void launchComputeSplitKernel(BinT* histograms,
                               size_t smem_size,
                               cudaStream_t builder_stream);
 
+// ExtraTrees random-split-position helper. HDI so a host-side oracle
+// (Python or gtest) can byte-compare against the device output.
+template <typename IdxT>
+HDI IdxT
+et_split_position(uint64_t seed, uint64_t treeid, uint64_t nodeid, uint64_t col, IdxT n_bins)
+{
+  // Subsequence mixes the low 32 bits of (treeid, nodeid, col); deliberate
+  // truncation. nodeid is tree->sparsetree.size() - 1 (size_t counter); fits
+  // in 32 bits while per-tree node count stays below 2^32. fnv1a32 returns
+  // uint32_t, so `subsequence` stays 32-bit throughout and is widened only
+  // when passed to PCGenerator's uint64_t subsequence parameter.
+  uint32_t subsequence = fnv1a32_basis;
+  subsequence          = fnv1a32(subsequence, static_cast<uint32_t>(treeid));
+  subsequence          = fnv1a32(subsequence, static_cast<uint32_t>(nodeid));
+  subsequence          = fnv1a32(subsequence, static_cast<uint32_t>(col));
+  raft::random::PCGenerator gen(seed, uint64_t(subsequence), uint64_t(0));
+  raft::random::UniformIntDistParams<IdxT, uint64_t> params;
+  // Half-open [0, n_bins - 1): n_bins quantile slots define n_bins - 1 split
+  // positions between adjacent slots; the last slot is never a valid split.
+  params.start = 0;
+  params.end   = n_bins - 1;
+  params.diff  = static_cast<uint64_t>(params.end - params.start);
+  IdxT idx;
+  raft::random::custom_next(gen, &idx, params, IdxT(0), IdxT(0));
+  return idx;
+}
+
+// ExtraTrees random-split launcher. Definition lives in
+// builder_random_kernels_impl.cuh; instantiated by the random_*-{float,double}
+// translation units.
+template <typename DataT,
+          typename LabelT,
+          typename IdxT,
+          int TPB,
+          typename ObjectiveT,
+          typename BinT>
+void launchRandomSplitKernel(BinT* histograms,
+                             int* unweighted_histograms,
+                             double* weighted_count_histograms,
+                             IdxT max_n_bins,
+                             IdxT min_samples_split,
+                             IdxT max_leaves,
+                             const Dataset<DataT, LabelT, IdxT>& dataset,
+                             const Quantiles<DataT, IdxT>& quantiles,
+                             const NodeWorkItem* work_items,
+                             IdxT colStart,
+                             const IdxT* colids,
+                             int* done_count,
+                             int* mutex,
+                             volatile Split<DataT, IdxT>* splits,
+                             ObjectiveT& objective,
+                             IdxT treeid,
+                             const WorkloadInfo<IdxT>* workload_info,
+                             uint64_t seed,
+                             dim3 grid,
+                             size_t smem_size,
+                             cudaStream_t builder_stream);
+
 }  // namespace DT
 }  // namespace ML

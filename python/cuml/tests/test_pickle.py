@@ -192,7 +192,7 @@ def test_rf_regression_pickle(
     result = {}
 
     def create_mod():
-        if key == "RandomForestRegressor":
+        if key in ("RandomForestRegressor", "ExtraTreesRegressor"):
             X_train, y_train, X_test = make_dataset(
                 datatype, nrows, ncols, n_info
             )

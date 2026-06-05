@@ -21,6 +21,8 @@ from sklearn.datasets import (
     make_classification,
     make_regression,
 )
+from sklearn.ensemble import ExtraTreesClassifier as sketc
+from sklearn.ensemble import ExtraTreesRegressor as sketr
 from sklearn.ensemble import RandomForestClassifier as skrfc
 from sklearn.ensemble import RandomForestRegressor as skrfr
 from sklearn.metrics import (
@@ -32,9 +34,12 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 
 import cuml
+from cuml.ensemble import ExtraTreesClassifier as cuetc
+from cuml.ensemble import ExtraTreesRegressor as cuetr
 from cuml.ensemble import RandomForestClassifier as curfc
 from cuml.ensemble import RandomForestRegressor as curfr
 from cuml.ensemble.randomforest_common import compute_max_features
+from cuml.explainer.tree_shap import TreeExplainer
 from cuml.internals.interop import UnsupportedOnGPU
 from cuml.metrics import accuracy_score as cuml_accuracy_score
 from cuml.metrics import r2_score
@@ -2079,3 +2084,960 @@ def test_rfr_sample_weight_positional_or_keyword(sample_weight_reg_data):
         .predict(X)
     )
     assert np.array_equal(p_pos, p_kw)
+
+
+def test_rfc_splitter_class_attribute_routes_to_random_kernel(
+    sample_weight_clf_data,
+):
+    """Subclassing RFC with `_splitter = 'random'` routes through SPLITTER_RANDOM
+    and produces predictions that diverge from the default `'best'` path on the
+    same data and seed.
+    """
+    X, y = sample_weight_clf_data
+
+    class RFCRandomSplitter(curfc):
+        _splitter = "random"
+
+    kwargs = dict(
+        n_estimators=10,
+        max_depth=6,
+        bootstrap=False,
+        random_state=42,
+        n_streams=1,
+    )
+    preds_random = cp.asnumpy(RFCRandomSplitter(**kwargs).fit(X, y).predict(X))
+    preds_best = cp.asnumpy(curfc(**kwargs).fit(X, y).predict(X))
+
+    assert preds_random.shape == (len(y),)
+    assert set(np.unique(preds_random)).issubset(set(np.unique(cp.asnumpy(y))))
+    # Multiple distinct labels: kernel actually split the trees rather than
+    # collapsing to root-only (which would emit the majority class everywhere).
+    assert len(np.unique(preds_random)) > 1
+    # SPLITTER_RANDOM and SPLITTER_BEST exercise different kernels at the same
+    # seed; identical predictions would mean the splitter param was ignored.
+    assert not np.array_equal(preds_random, preds_best)
+
+
+def test_rfc_unknown_splitter_raises(sample_weight_clf_data):
+    """Unknown _splitter values raise ValueError at fit time, naming the class."""
+    X, y = sample_weight_clf_data
+
+    class RFCBadSplitter(curfc):
+        _splitter = "bogus"
+
+    clf = RFCBadSplitter(
+        n_estimators=2, max_depth=3, random_state=0, n_streams=1
+    )
+    with pytest.raises(
+        ValueError, match=r"Unknown splitter value 'bogus' on RFCBadSplitter"
+    ):
+        clf.fit(X, y)
+
+
+def test_extra_trees_classifier_smoke(sample_weight_clf_data):
+    """ExtraTreesClassifier fits and predicts; bootstrap defaults to False and
+    predictions diverge from RandomForestClassifier on the same data + seed."""
+    X, y = sample_weight_clf_data
+
+    etc = cuetc(n_estimators=10, max_depth=6, random_state=42, n_streams=1)
+    assert etc.bootstrap is False
+    assert etc._splitter == "random"
+    assert etc._cpu_class_path == "sklearn.ensemble.ExtraTreesClassifier"
+
+    etc.fit(X, y)
+    preds_etc = cp.asnumpy(etc.predict(X))
+    assert preds_etc.shape == (len(y),)
+    assert len(np.unique(preds_etc)) > 1
+
+    rfc_preds = cp.asnumpy(
+        curfc(
+            n_estimators=10,
+            max_depth=6,
+            bootstrap=False,
+            random_state=42,
+            n_streams=1,
+        )
+        .fit(X, y)
+        .predict(X)
+    )
+    assert not np.array_equal(preds_etc, rfc_preds)
+
+
+def test_extra_trees_classifier_n_bins_below_two_raises(
+    sample_weight_clf_data,
+):
+    """ETC inherits the C++ validity_check guard requiring n_bins >= 2."""
+    X, y = sample_weight_clf_data
+    etc = cuetc(
+        n_estimators=2, max_depth=3, n_bins=1, random_state=0, n_streams=1
+    )
+    with pytest.raises(
+        RuntimeError, match=r"SPLITTER_RANDOM requires max_n_bins >= 2"
+    ):
+        etc.fit(X, y)
+
+
+def test_extra_trees_classifier_sklearn_parity_accuracy(
+    sample_weight_clf_data,
+):
+    """cuETC and sklearn ETC reach comparable accuracy on a shared 3-class
+    fixture. Band absorbs the quantile-grid divergence noted in the ETC
+    class docstring."""
+    X, y = sample_weight_clf_data
+
+    cu = cuetc(n_estimators=30, max_depth=8, random_state=0, n_streams=1)
+    sk = sketc(n_estimators=30, max_depth=8, random_state=0)
+    cu.fit(X, y)
+    sk.fit(cp.asnumpy(X), cp.asnumpy(y))
+
+    cu_acc = accuracy_score(cp.asnumpy(y), cp.asnumpy(cu.predict(X)))
+    sk_acc = accuracy_score(cp.asnumpy(y), sk.predict(cp.asnumpy(X)))
+    # Observed: mean=0.020, range=[0.005, 0.058], stderr=0.005 across
+    # n_estimators in {10, 30, 50} x seeds in {0, 1, 7} (9 runs); 0.10
+    # band absorbs the quantile-grid divergence at deeper nodes.
+    assert abs(cu_acc - sk_acc) < 0.10
+
+
+def test_extra_trees_classifier_sample_weight_ones_matches_none(
+    sample_weight_clf_data,
+):
+    """ETC under unit `sample_weight` matches `sample_weight=None`
+    byte-for-byte on full class probabilities (tighter than argmax-only
+    so a 1-bit-different leaf probability that happens to argmax the same
+    class is still caught). The companion-buffer path on SPLITTER_RANDOM
+    should be a no-op when every row's weight is 1.0."""
+    X, y = sample_weight_clf_data
+    w = cp.ones(len(y), dtype=cp.float32)
+
+    base = cuetc(n_estimators=10, max_depth=6, random_state=0, n_streams=1)
+    weighted = cuetc(n_estimators=10, max_depth=6, random_state=0, n_streams=1)
+    base.fit(X, y)
+    weighted.fit(X, y, sample_weight=w)
+    np.testing.assert_array_equal(
+        cp.asnumpy(base.predict_proba(X)),
+        cp.asnumpy(weighted.predict_proba(X)),
+    )
+
+
+def test_extra_trees_classifier_sample_weight_runs(sample_weight_clf_data):
+    """ETC fits with non-uniform sample_weight, predicts non-trivially, and
+    diverges from the no-weight baseline (the weights actually flow into the
+    kernel rather than being silently dropped)."""
+    X, y = sample_weight_clf_data
+    rng = np.random.default_rng(7)
+    w = cp.asarray(rng.uniform(0.5, 2.0, len(y)).astype(np.float32))
+
+    base = cuetc(n_estimators=10, max_depth=6, random_state=0, n_streams=1)
+    weighted = cuetc(n_estimators=10, max_depth=6, random_state=0, n_streams=1)
+    base.fit(X, y)
+    weighted.fit(X, y, sample_weight=w)
+
+    base_preds = cp.asnumpy(base.predict(X))
+    weighted_preds = cp.asnumpy(weighted.predict(X))
+    assert weighted_preds.shape == (len(y),)
+    assert len(np.unique(weighted_preds)) > 1
+    # Observed disagreement rate on this fixture across seeds {0, 1, 7}:
+    # mean=0.22, min=0.13. A single coincidental match would not approach 0.05.
+    assert np.mean(base_preds != weighted_preds) > 0.05
+
+
+def test_extra_trees_classifier_class_weight_runs(sample_weight_clf_data):
+    """ETC fits with non-trivial class_weight, resolves `class_weight_` via
+    the inherited process_class_weight helper, and produces different
+    predictions than the unweighted baseline. Uses a heavily-imbalanced
+    dict ({0: 5.0, 1: 1.0, 2: 1.0}) rather than 'balanced' so the divergence
+    signal stays clear even when the fixture has near-balanced labels."""
+    X, y = sample_weight_clf_data
+
+    base = cuetc(n_estimators=10, max_depth=6, random_state=0, n_streams=1)
+    weighted = cuetc(
+        n_estimators=10,
+        max_depth=6,
+        random_state=0,
+        n_streams=1,
+        class_weight={0: 5.0, 1: 1.0, 2: 1.0},
+    )
+    base.fit(X, y)
+    weighted.fit(X, y)
+
+    # The fitted attribute is the per-class float array produced by
+    # process_class_weight; shape == (n_classes,).
+    assert hasattr(weighted, "class_weight_")
+    assert weighted.class_weight_ is not None
+    assert weighted.class_weight_.shape == (len(np.unique(cp.asnumpy(y))),)
+
+    base_preds = cp.asnumpy(base.predict(X))
+    weighted_preds = cp.asnumpy(weighted.predict(X))
+    assert not np.array_equal(base_preds, weighted_preds)
+
+
+def test_extra_trees_classifier_fractional_weights_complete_fit(
+    sample_weight_clf_data,
+):
+    """ETC under fractional `sample_weight=0.5` completes the fit without
+    divide-by-zero or a degenerate tree. The gate semantic (integer counts
+    vs weighted sums) is pinned at the helper level by the C++ gtest."""
+    X, y = sample_weight_clf_data
+    w = cp.full(len(y), 0.5, dtype=cp.float32)
+
+    etc = cuetc(
+        n_estimators=5,
+        max_depth=4,
+        min_samples_leaf=20,
+        random_state=0,
+        n_streams=1,
+    )
+    etc.fit(X, y, sample_weight=w)
+    preds = cp.asnumpy(etc.predict(X))
+    assert preds.shape == (len(y),)
+    assert len(np.unique(preds)) > 1
+
+
+def test_extra_trees_regressor_smoke(sample_weight_reg_data):
+    """ExtraTreesRegressor fits and predicts; bootstrap defaults to False,
+    max_features defaults to 1.0, and predictions diverge from
+    RandomForestRegressor on the same data + seed."""
+    X, y = sample_weight_reg_data
+
+    etr = cuetr(n_estimators=10, max_depth=6, random_state=42, n_streams=1)
+    assert etr.bootstrap is False
+    assert etr.max_features == 1.0
+    assert etr._splitter == "random"
+    assert etr._cpu_class_path == "sklearn.ensemble.ExtraTreesRegressor"
+
+    etr.fit(X, y)
+    preds_etr = cp.asnumpy(etr.predict(X))
+    assert preds_etr.shape == (len(y),)
+    r2 = r2_score(cp.asarray(y), cp.asarray(preds_etr))
+    assert r2 > 0.5
+
+    rfr_preds = cp.asnumpy(
+        curfr(
+            n_estimators=10,
+            max_depth=6,
+            bootstrap=False,
+            random_state=42,
+            n_streams=1,
+        )
+        .fit(X, y)
+        .predict(X)
+    )
+    assert not np.array_equal(preds_etr, rfr_preds)
+
+
+def test_extra_trees_regressor_n_bins_below_two_raises(sample_weight_reg_data):
+    """ETR inherits the C++ validity_check guard requiring n_bins >= 2."""
+    X, y = sample_weight_reg_data
+    etr = cuetr(
+        n_estimators=2, max_depth=3, n_bins=1, random_state=0, n_streams=1
+    )
+    with pytest.raises(
+        RuntimeError, match=r"SPLITTER_RANDOM requires max_n_bins >= 2"
+    ):
+        etr.fit(X, y)
+
+
+def test_extra_trees_regressor_sklearn_parity_r2(sample_weight_reg_data):
+    """cuETR and sklearn ETR reach comparable R² on a shared synthetic
+    regression fixture. Tolerance band absorbs the quantile-grid divergence
+    documented in ETR's docstring."""
+    X, y = sample_weight_reg_data
+
+    cu = cuetr(n_estimators=30, max_depth=8, random_state=0, n_streams=1)
+    sk = sketr(n_estimators=30, max_depth=8, random_state=0)
+    cu.fit(X, y)
+    sk.fit(cp.asnumpy(X), cp.asnumpy(y))
+
+    cu_r2 = r2_score(y, cu.predict(X))
+    sk_preds = cp.asarray(sk.predict(cp.asnumpy(X)))
+    sk_r2 = r2_score(y, sk_preds)
+    # Observed: mean delta=0.04, range=[0.01, 0.09] across n_estimators in
+    # {10, 30, 50} x seeds in {0, 1, 7}; 0.20 band absorbs the higher
+    # variance of in-sample R² vs in-sample accuracy.
+    assert abs(cu_r2 - sk_r2) < 0.20
+
+
+def test_extra_trees_regressor_sample_weight_ones_matches_none(
+    sample_weight_reg_data,
+):
+    """ETR under sample_weight=cp.ones(n) matches sample_weight=None
+    byte-for-byte. Regressor side of the unit-weight invariance, exercised
+    through the same companion-buffer code path on the random-split kernel."""
+    X, y = sample_weight_reg_data
+    w = cp.ones(len(y), dtype=cp.float32)
+
+    base = cuetr(n_estimators=10, max_depth=6, random_state=0, n_streams=1)
+    weighted = cuetr(n_estimators=10, max_depth=6, random_state=0, n_streams=1)
+    base.fit(X, y)
+    weighted.fit(X, y, sample_weight=w)
+    np.testing.assert_array_equal(
+        cp.asnumpy(base.predict(X)),
+        cp.asnumpy(weighted.predict(X)),
+    )
+
+
+def test_extra_trees_regressor_sample_weight_runs(sample_weight_reg_data):
+    """ETR fits with non-uniform sample_weight and diverges from the
+    no-weight baseline (the weights flow into the regressor kernel rather
+    than being silently dropped)."""
+    X, y = sample_weight_reg_data
+    rng = np.random.default_rng(7)
+    w = cp.asarray(rng.uniform(0.5, 2.0, len(y)).astype(np.float32))
+
+    base = cuetr(n_estimators=10, max_depth=6, random_state=0, n_streams=1)
+    weighted = cuetr(n_estimators=10, max_depth=6, random_state=0, n_streams=1)
+    base.fit(X, y)
+    weighted.fit(X, y, sample_weight=w)
+
+    base_preds = cp.asnumpy(base.predict(X))
+    weighted_preds = cp.asnumpy(weighted.predict(X))
+    assert weighted_preds.shape == (len(y),)
+    # Observed mean absolute prediction delta on this fixture across seeds
+    # {0, 1, 7}: mean=4.2, min=1.8. A coincidental near-zero would not approach 0.1.
+    assert float(np.mean(np.abs(base_preds - weighted_preds))) > 0.1
+
+
+def test_extra_trees_classifier_balanced_subsample_collapses_without_bootstrap(
+    imbalanced_clf_data,
+):
+    """ETC mirrors the RFC + sklearn semantic: bootstrap=False makes
+    class_weight='balanced_subsample' indistinguishable from 'balanced'
+    since there is no per-tree subsample to weight by. Locks the docstring
+    claim on extra_trees_classifier.py and adds a cross-backend leg vs
+    sklearn so a future change that translates the string sentinel to
+    something other than 'balanced' is caught."""
+    X, y = imbalanced_clf_data
+    clf_collapsed = cuetc(
+        n_estimators=5,
+        max_depth=4,
+        random_state=0,
+        n_streams=1,
+        class_weight="balanced_subsample",
+        bootstrap=False,
+    )
+    clf_collapsed.fit(X, y)
+
+    clf_balanced = cuetc(
+        n_estimators=5,
+        max_depth=4,
+        random_state=0,
+        n_streams=1,
+        class_weight="balanced",
+        bootstrap=False,
+    )
+    clf_balanced.fit(X, y)
+    np.testing.assert_array_equal(
+        clf_collapsed.class_weight_, clf_balanced.class_weight_
+    )
+    np.testing.assert_array_equal(
+        cp.asnumpy(clf_collapsed.predict(X)),
+        cp.asnumpy(clf_balanced.predict(X)),
+    )
+    # Cross-backend leg: sklearn substitutes 'balanced' for 'balanced_subsample'
+    # internally when not bootstrap (_forest.py); same configuration should
+    # give comparable accuracy.
+    sk_balanced = sketc(
+        n_estimators=5,
+        max_depth=4,
+        random_state=0,
+        class_weight="balanced",
+        bootstrap=False,
+    )
+    sk_balanced.fit(cp.asnumpy(X), cp.asnumpy(y))
+    cu_acc = accuracy_score(cp.asnumpy(y), cp.asnumpy(clf_balanced.predict(X)))
+    sk_acc = accuracy_score(cp.asnumpy(y), sk_balanced.predict(cp.asnumpy(X)))
+    # Observed delta across seeds {0, 1, 7, 42, 123}: min=0.02 max=0.08 mean=0.05.
+    # 0.10 band gives ~1.2x margin over the observed maximum.
+    assert abs(cu_acc - sk_acc) < 0.10
+
+
+def test_extra_trees_classifier_reproducibility_with_seed(
+    sample_weight_clf_data,
+):
+    """Two ETC fits with the same random_state on the same X, y produce
+    byte-identical predict_proba. Determinism covers both the FNV1a-seeded
+    et_split_position RNG and the bootstrap row-sampling RNG."""
+    X, y = sample_weight_clf_data
+    a = cuetc(n_estimators=10, max_depth=6, random_state=7, n_streams=1)
+    b = cuetc(n_estimators=10, max_depth=6, random_state=7, n_streams=1)
+    a.fit(X, y)
+    b.fit(X, y)
+    np.testing.assert_array_equal(
+        cp.asnumpy(a.predict_proba(X)),
+        cp.asnumpy(b.predict_proba(X)),
+    )
+
+
+def test_extra_trees_regressor_reproducibility_with_seed(
+    sample_weight_reg_data,
+):
+    """Two ETR fits with the same random_state produce byte-identical
+    predict output. Regressor side of the same determinism guarantee."""
+    X, y = sample_weight_reg_data
+    a = cuetr(n_estimators=10, max_depth=6, random_state=7, n_streams=1)
+    b = cuetr(n_estimators=10, max_depth=6, random_state=7, n_streams=1)
+    a.fit(X, y)
+    b.fit(X, y)
+    np.testing.assert_array_equal(
+        cp.asnumpy(a.predict(X)),
+        cp.asnumpy(b.predict(X)),
+    )
+
+
+def test_extra_trees_classifier_predict_matches_argmax_of_predict_proba(
+    sample_weight_clf_data,
+):
+    """For every row, predict(X)[i] == argmax(predict_proba(X)[i]) and the
+    per-row probabilities sum to 1. Basic probability/argmax invariant that
+    must hold for any well-formed classifier; pins it through the leaf-vote
+    aggregation in the ensemble."""
+    X, y = sample_weight_clf_data
+    clf = cuetc(n_estimators=10, max_depth=6, random_state=0, n_streams=1)
+    clf.fit(X, y)
+    proba = cp.asnumpy(clf.predict_proba(X))
+    pred = cp.asnumpy(clf.predict(X))
+    # Float32 ULP near 1.0 is ~6e-8; 1e-6 absorbs ~16x ULP across 3 classes.
+    np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-6)
+    np.testing.assert_array_equal(
+        proba.argmax(axis=1).astype(pred.dtype), pred
+    )
+
+
+def test_extra_trees_classifier_feature_importance_matches_sklearn():
+    """cuML ETC and sklearn ETC report close per-feature importances on
+    the same fixed classification fixture. The aim is to anchor cuML's
+    importance computation (impurity accumulation + per-tree normalization
+    + ensemble averaging) to the reference implementation rather than to
+    a heuristic property like 'informative > noise', which can pass
+    spuriously when random splits happen to find signal in noise features."""
+    X, y = make_classification(
+        n_samples=400,
+        n_features=10,
+        n_informative=5,
+        n_redundant=0,
+        n_repeated=0,
+        random_state=42,
+    )
+    Xcp = cp.asarray(X, dtype=cp.float32)
+    ycp = cp.asarray(y, dtype=cp.int32)
+    cu = cuetc(n_estimators=30, max_depth=8, random_state=0, n_streams=1)
+    cu.fit(Xcp, ycp)
+    sk = sketc(n_estimators=30, max_depth=8, random_state=0)
+    sk.fit(X, y)
+    cu_imp = cp.asnumpy(cu.feature_importances_)
+    sk_imp = sk.feature_importances_
+    # Observed max per-feature delta across seeds {0, 1, 7, 42}: < 0.03.
+    # 0.05 band absorbs the quantile-grid divergence and RNG variance
+    # with ~1.7x margin over the observed maximum.
+    np.testing.assert_allclose(cu_imp, sk_imp, atol=0.05)
+
+
+def test_extra_trees_regressor_feature_importance_matches_sklearn():
+    """Regressor side of the importance-parity check. At seed=42 cuML and
+    sklearn both rank features 5..9 above 0..4 on this fixture because
+    random splits scatter mass to high-variance noise features on small
+    synthetic regression data. An 'informative > noise' heuristic would
+    not hold for either backend; the meaningful invariant is that cuML
+    matches sklearn's importance distribution within tolerance."""
+    X, y = make_regression(
+        n_samples=400,
+        n_features=10,
+        n_informative=5,
+        noise=0.5,
+        random_state=42,
+    )
+    Xcp = cp.asarray(X, dtype=cp.float32)
+    ycp = cp.asarray(y, dtype=cp.float32)
+    cu = cuetr(n_estimators=30, max_depth=8, random_state=0, n_streams=1)
+    cu.fit(Xcp, ycp)
+    sk = sketr(n_estimators=30, max_depth=8, random_state=0)
+    sk.fit(X, y)
+    cu_imp = cp.asnumpy(cu.feature_importances_)
+    sk_imp = sk.feature_importances_
+    # Observed max per-feature delta across seeds {0, 1, 7, 42}: < 0.02.
+    # 0.05 band absorbs the quantile-grid divergence and RNG variance
+    # with comfortable margin over the observed maximum.
+    np.testing.assert_allclose(cu_imp, sk_imp, atol=0.05)
+
+
+def test_extra_trees_classifier_treelite_score_preservation_via_as_sklearn(
+    sample_weight_clf_data,
+):
+    """cu_model.score and cu_model.as_sklearn().score on the same X agree
+    to fp32-rounding distance. Verifies the treelite export round-trip:
+    the same underlying trees should produce near-identical predictions
+    whether invoked directly on cuML or via the sklearn-compatible wrapper.
+    Complements the test in test_sklearn_import_export.py which exercises
+    both as_sklearn() and from_sklearn() legs; this one isolates the
+    as_sklearn() leg."""
+    X, y = sample_weight_clf_data
+    cu = cuetc(n_estimators=20, max_depth=8, random_state=0, n_streams=1)
+    cu.fit(X, y)
+    sk_export = cu.as_sklearn()
+    cu_score = float(cu.score(X, y))
+    sk_score = float(sk_export.score(cp.asnumpy(X), cp.asnumpy(y)))
+    # Observed delta < 0.005 on accuracy across the fixture; 0.01 absorbs rounding.
+    assert abs(cu_score - sk_score) < 0.01
+
+
+def test_extra_trees_regressor_treelite_score_preservation_via_as_sklearn(
+    sample_weight_reg_data,
+):
+    """Regressor variant of the treelite as_sklearn() round-trip check.
+    R² gets a slightly wider band than accuracy since it's a ratio metric
+    with higher in-sample variance."""
+    X, y = sample_weight_reg_data
+    cu = cuetr(n_estimators=20, max_depth=8, random_state=0, n_streams=1)
+    cu.fit(X, y)
+    sk_export = cu.as_sklearn()
+    cu_score = float(cu.score(X, y))
+    sk_score = float(sk_export.score(cp.asnumpy(X), cp.asnumpy(y)))
+    # Observed delta < 0.01 on R² across the fixture; 0.02 absorbs ratio variance.
+    assert abs(cu_score - sk_score) < 0.02
+
+
+@pytest.mark.parametrize(
+    "n_estimators",
+    [unit_param(30), quality_param(100)],
+)
+def test_extra_trees_classifier_held_out_accuracy_on_large_fixture(
+    n_estimators,
+):
+    """End-to-end predictive performance for ETC: train on 8000 samples,
+    evaluate on a held-out 2000-row fold, demand accuracy above a
+    meaningful floor. Probed across seeds {0, 1, 7, 42, 123} at
+    n_estimators=100: observed range 0.887-0.922. n_estimators=30 on the
+    unit tier stays comfortably above 0.85; --run_quality runs the full
+    n_estimators=100 config in addition."""
+    X, y = make_classification(
+        n_samples=10000,
+        n_features=10,
+        n_informative=5,
+        n_redundant=0,
+        n_repeated=0,
+        random_state=42,
+    )
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+    clf = cuetc(
+        n_estimators=n_estimators, max_depth=12, random_state=0, n_streams=1
+    )
+    clf.fit(
+        cp.asarray(X_tr, dtype=cp.float32),
+        cp.asarray(y_tr, dtype=cp.int32),
+    )
+    preds = cp.asnumpy(clf.predict(cp.asarray(X_te, dtype=cp.float32)))
+    acc = accuracy_score(y_te, preds)
+    assert acc > 0.85
+
+
+@pytest.mark.parametrize(
+    "n_estimators",
+    [unit_param(30), quality_param(100)],
+)
+def test_extra_trees_regressor_held_out_r2_on_large_fixture(n_estimators):
+    """On the 10k-sample regression fixture, ETR achieves R² > 0.90 on a
+    held-out 2000-row fold. Probed across seeds {0, 1, 7, 42, 123} at
+    n_estimators=100: observed range 0.939-0.969."""
+    X, y = make_regression(
+        n_samples=10000,
+        n_features=10,
+        n_informative=5,
+        noise=0.5,
+        random_state=42,
+    )
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+    reg = cuetr(
+        n_estimators=n_estimators, max_depth=12, random_state=0, n_streams=1
+    )
+    reg.fit(
+        cp.asarray(X_tr, dtype=cp.float32),
+        cp.asarray(y_tr, dtype=cp.float32),
+    )
+    preds = cp.asnumpy(reg.predict(cp.asarray(X_te, dtype=cp.float32)))
+    held_out_r2 = r2_score(y_te, preds)
+    assert held_out_r2 > 0.90
+
+
+@pytest.mark.parametrize(
+    "n_est_high",
+    [unit_param(50), quality_param(200)],
+)
+def test_extra_trees_classifier_more_trees_improves_held_out_accuracy(
+    n_est_high,
+):
+    """Geurts 2006 claim: ExtraTrees variance shrinks with more estimators.
+    On a 10k-sample fixture with held-out 2000 samples, mean accuracy
+    across three model seeds at n_estimators=n_est_high should exceed mean
+    accuracy at n_estimators=10 by a clear margin. Probed gaps: at
+    n_est_high=50 mean delta ~0.012; at 200 mean delta ~0.018. 0.005
+    margin tolerates ~2x the observed seed variance while still asserting
+    the convergence direction."""
+    X, y = make_classification(
+        n_samples=10000,
+        n_features=10,
+        n_informative=5,
+        n_redundant=0,
+        n_repeated=0,
+        random_state=42,
+    )
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+    X_tr_cp = cp.asarray(X_tr, dtype=cp.float32)
+    y_tr_cp = cp.asarray(y_tr, dtype=cp.int32)
+    X_te_cp = cp.asarray(X_te, dtype=cp.float32)
+
+    def mean_accuracy(n_estimators):
+        accs = []
+        for s in (0, 1, 2):
+            clf = cuetc(
+                n_estimators=n_estimators,
+                max_depth=12,
+                random_state=s,
+                n_streams=1,
+            )
+            clf.fit(X_tr_cp, y_tr_cp)
+            preds = cp.asnumpy(clf.predict(X_te_cp))
+            accs.append(accuracy_score(y_te, preds))
+        return float(np.mean(accs))
+
+    assert mean_accuracy(n_est_high) > mean_accuracy(10) + 0.005
+
+
+def test_extra_trees_regressor_shap_additivity_holds_to_float32_precision():
+    """SHAP additivity: for every row, sum of SHAP values plus
+    expected_value equals the model prediction. Validated via
+    cuml.explainer.TreeExplainer on ETR across multiple data seeds.
+    Observed max absolute reconstruction delta < 1e-4 on regression
+    outputs spanning O(100). Catches wrong path traversal, incorrect
+    expected value, lost contributions in the GPU SHAP kernel."""
+    X, y = make_regression(
+        n_samples=500,
+        n_features=8,
+        n_informative=4,
+        noise=0.5,
+        random_state=42,
+    )
+    Xcp = cp.asarray(X, dtype=cp.float32)
+    ycp = cp.asarray(y, dtype=cp.float32)
+    reg = cuetr(n_estimators=20, max_depth=6, random_state=0, n_streams=1)
+    reg.fit(Xcp, ycp)
+    explainer = TreeExplainer(model=reg)
+    sv = np.asarray(explainer.shap_values(X.astype(np.float32)))
+    assert sv.ndim == 2  # regressor returns (n_samples, n_features)
+    ev = float(np.asarray(explainer.expected_value).reshape(-1)[0])
+    preds = cp.asnumpy(reg.predict(Xcp))
+    reconstructed = sv.sum(axis=1) + ev
+    # Observed max abs delta < 1e-4 across seeds 0..9 with |y| up to ~300;
+    # 5e-4 absorbs fp32 ULP accumulation with comfortable margin.
+    np.testing.assert_allclose(reconstructed, preds, atol=5e-4)
+
+
+def test_extra_trees_classifier_shap_additivity_holds_to_float32_precision():
+    """SHAP additivity for binary ETC: shap_values[:, :, 1].sum(axis=1)
+    plus expected_value[1] reconstructs predict_proba[:, 1] for every row.
+    Probed max abs delta 1.19e-07 (one ULP) across seeds {0, 7, 42}."""
+    X, y = make_classification(
+        n_samples=500,
+        n_features=8,
+        n_informative=4,
+        n_redundant=0,
+        n_repeated=0,
+        random_state=42,
+        shuffle=False,
+    )
+    Xcp = cp.asarray(X, dtype=cp.float32)
+    ycp = cp.asarray(y, dtype=cp.int32)
+    clf = cuetc(n_estimators=20, max_depth=6, random_state=0, n_streams=1)
+    clf.fit(Xcp, ycp)
+    explainer = TreeExplainer(model=clf)
+    sv = np.asarray(explainer.shap_values(X.astype(np.float32)))
+    # Binary classifier SHAP shape from cuml TreeExplainer:
+    # (n_samples, n_features, n_classes). Class-1 contributions + ev[1]
+    # should reconstruct predict_proba[:, 1].
+    assert sv.shape == (X.shape[0], X.shape[1], 2)
+    ev = np.asarray(explainer.expected_value).reshape(-1)
+    proba = cp.asnumpy(clf.predict_proba(Xcp))
+    reconstructed_class1 = sv[..., 1].sum(axis=1) + ev[1]
+    # Observed max delta 1.19e-07 (one fp32 ULP); 1e-5 is safe.
+    np.testing.assert_allclose(reconstructed_class1, proba[:, 1], atol=1e-5)
+
+
+def test_extra_trees_regressor_shap_identifies_informative_features_on_large_fixture():
+    """SHAP discrimination on ETR: train on a 2000-sample fixture where
+    the first 5 of 10 features are informative (shuffle=False suppresses
+    make_regression's default column permutation, so 'informative' actually
+    means the first 5 columns), then assert mean |SHAP| over the
+    informative block is at least 10x mean |SHAP| over the noise block.
+    Probed across seeds {0, 7, 42, 123}: observed ratio 74x-96x; the 10x
+    floor catches a regression that scatters attribution to noise features
+    without flaking on RNG."""
+    X, y = make_regression(
+        n_samples=2000,
+        n_features=10,
+        n_informative=5,
+        noise=0.5,
+        random_state=42,
+        shuffle=False,
+    )
+    Xcp = cp.asarray(X, dtype=cp.float32)
+    ycp = cp.asarray(y, dtype=cp.float32)
+    reg = cuetr(n_estimators=30, max_depth=8, random_state=0, n_streams=1)
+    reg.fit(Xcp, ycp)
+    explainer = TreeExplainer(model=reg)
+    # 200 rows stabilizes mean |SHAP| ranking; SHAP runtime is O(n*d*depth).
+    sv = np.asarray(explainer.shap_values(X[:200].astype(np.float32)))
+    assert sv.ndim == 2  # regressor returns (n_samples, n_features)
+    mean_abs_shap = np.abs(sv).mean(axis=0)
+    informative_block = mean_abs_shap[:5].mean()
+    noise_block = mean_abs_shap[5:].mean()
+    assert informative_block > 10.0 * noise_block
+
+
+def test_extra_trees_classifier_shap_identifies_informative_features_on_large_fixture():
+    """Classifier side of the SHAP discrimination check. shuffle=False
+    keeps the first 5 features informative. Probed across seeds
+    {0, 7, 42, 123}: mean |SHAP| on the informative block is 16x-26x the
+    noise block. The 5x floor leaves room for fixture variance and still
+    asserts that SHAP attributes mass to the informative features."""
+    X, y = make_classification(
+        n_samples=2000,
+        n_features=10,
+        n_informative=5,
+        n_redundant=0,
+        n_repeated=0,
+        random_state=42,
+        shuffle=False,
+    )
+    Xcp = cp.asarray(X, dtype=cp.float32)
+    ycp = cp.asarray(y, dtype=cp.int32)
+    clf = cuetc(n_estimators=30, max_depth=8, random_state=0, n_streams=1)
+    clf.fit(Xcp, ycp)
+    explainer = TreeExplainer(model=clf)
+    # 200 rows stabilizes mean |SHAP| ranking; SHAP runtime is O(n*d*depth).
+    sv = np.asarray(explainer.shap_values(X[:200].astype(np.float32)))
+    # Take class-1 SHAP for the binary classifier; same as predict_proba[:, 1].
+    assert sv.ndim == 3 and sv.shape[-1] == 2
+    mean_abs_shap = np.abs(sv[..., 1]).mean(axis=0)
+    informative_block = mean_abs_shap[:5].mean()
+    noise_block = mean_abs_shap[5:].mean()
+    assert informative_block > 5.0 * noise_block
+
+
+def test_extra_trees_classifier_different_seeds_produce_different_predictions(
+    sample_weight_clf_data,
+):
+    """Negative pair for the reproducibility pin: two ETC fits with
+    DIFFERENT random_state on the same X, y must produce different
+    predict_proba. Without this, a refactor that silently ignored
+    random_state would still pass the determinism test (both fits would
+    be deterministic at the same fixed RNG path) but break ensemble
+    diversity in production."""
+    X, y = sample_weight_clf_data
+    a = cuetc(n_estimators=10, max_depth=6, random_state=7, n_streams=1).fit(
+        X, y
+    )
+    b = cuetc(n_estimators=10, max_depth=6, random_state=11, n_streams=1).fit(
+        X, y
+    )
+    pa = cp.asnumpy(a.predict_proba(X))
+    pb = cp.asnumpy(b.predict_proba(X))
+    assert not np.array_equal(pa, pb)
+    # Observed across seed pairs {(0, 1), (7, 11), (42, 123)}: 100% of
+    # rows differ in predict_proba. 0.5 floor catches a refactor that
+    # silently collapses random_state to a constant.
+    assert (np.abs(pa - pb).sum(axis=1) > 1e-7).mean() > 0.5
+
+
+def test_extra_trees_regressor_different_seeds_produce_different_predictions(
+    sample_weight_reg_data,
+):
+    """Regressor variant of the seed-divergence check; different seeds
+    produce different ensemble means by construction."""
+    X, y = sample_weight_reg_data
+    a = cuetr(n_estimators=10, max_depth=6, random_state=7, n_streams=1).fit(
+        X, y
+    )
+    b = cuetr(n_estimators=10, max_depth=6, random_state=11, n_streams=1).fit(
+        X, y
+    )
+    pa = cp.asnumpy(a.predict(X))
+    pb = cp.asnumpy(b.predict(X))
+    assert not np.array_equal(pa, pb)
+    # Observed mean_abs_delta across seed pairs {(0, 1), (7, 11), (42, 123)}:
+    # 11.5-12.2. 1.0 floor catches a refactor that silently collapses
+    # random_state to a constant.
+    assert float(np.mean(np.abs(pa - pb))) > 1.0
+
+
+def test_extra_trees_classifier_reproducibility_multi_stream(
+    sample_weight_clf_data,
+):
+    """Determinism under multi-stream scheduling (n_streams=4). The cuML
+    scheduler assigns trees to streams by tree_id % n_streams, deterministic
+    given a fixed seed. This catches a future scheduler change to work-
+    stealing that would lose byte-equal predict_proba across repeated fits.
+    Precondition: intra-CTA atomicAdd ordering is hardware-deterministic,
+    which holds across cuML's tested architectures."""
+    X, y = sample_weight_clf_data
+    a = cuetc(n_estimators=20, max_depth=6, random_state=7, n_streams=4).fit(
+        X, y
+    )
+    b = cuetc(n_estimators=20, max_depth=6, random_state=7, n_streams=4).fit(
+        X, y
+    )
+    np.testing.assert_array_equal(
+        cp.asnumpy(a.predict_proba(X)),
+        cp.asnumpy(b.predict_proba(X)),
+    )
+
+
+def test_extra_trees_regressor_reproducibility_multi_stream(
+    sample_weight_reg_data,
+):
+    """Regressor variant of the multi-stream determinism check; same
+    tree-to-stream assignment and atomicAdd precondition as the ETC test."""
+    X, y = sample_weight_reg_data
+    a = cuetr(n_estimators=20, max_depth=6, random_state=7, n_streams=4).fit(
+        X, y
+    )
+    b = cuetr(n_estimators=20, max_depth=6, random_state=7, n_streams=4).fit(
+        X, y
+    )
+    np.testing.assert_array_equal(
+        cp.asnumpy(a.predict(X)),
+        cp.asnumpy(b.predict(X)),
+    )
+
+
+def test_extra_trees_classifier_class_weight_balanced_predict_proba(
+    imbalanced_clf_data,
+):
+    """Directional class_weight='balanced' check for ETC routed through
+    SPLITTER_RANDOM. The divergence test in _class_weight_runs would still
+    pass if the random-split objective silently ignored class_weight; this
+    directional pin would not."""
+    X, y = imbalanced_clf_data
+    base = cuetc(n_estimators=20, max_depth=6, random_state=0, n_streams=1)
+    weighted = cuetc(
+        n_estimators=20,
+        max_depth=6,
+        random_state=0,
+        n_streams=1,
+        class_weight="balanced",
+    )
+    base.fit(X, y)
+    weighted.fit(X, y)
+    p_base = cp.asnumpy(base.predict_proba(X))
+    p_weighted = cp.asnumpy(weighted.predict_proba(X))
+    assert p_base.shape == (X.shape[0], 2)
+    assert p_weighted.shape == (X.shape[0], 2)
+    # Float32 ULP near 1.0 is ~6e-8; 1e-6 absorbs accumulation across 2 classes.
+    np.testing.assert_allclose(p_base.sum(axis=1), 1.0, atol=1e-6)
+    np.testing.assert_allclose(p_weighted.sum(axis=1), 1.0, atol=1e-6)
+    # Mean minority probability rises under balanced; observed shift
+    # p_weighted[:, 1].mean() - p_base[:, 1].mean() ~ 0.20 on this fixture.
+    assert p_weighted[:, 1].mean() > p_base[:, 1].mean()
+
+
+def test_extra_trees_classifier_sample_weight_biases_minority_class():
+    """Analog of test_rfc_sample_weight_biases_minority_class routed
+    through the SPLITTER_RANDOM kernel. Heavy weights on class 0 should
+    shift the predicted class distribution toward class 0 vs the
+    unweighted baseline. Catches a regression where sample_weight is
+    dropped before reaching the random-split histogram accumulation."""
+    X, y = make_classification(
+        n_samples=200, n_features=5, n_classes=2, random_state=42
+    )
+    X = cp.asarray(X, dtype=cp.float32)
+    y = cp.asarray(y, dtype=cp.int32)
+    weights = cp.where(y == 0, 10.0, 0.1).astype(cp.float32)
+
+    uniform = cuetc(n_estimators=20, max_depth=4, random_state=0, n_streams=1)
+    biased = cuetc(n_estimators=20, max_depth=4, random_state=0, n_streams=1)
+    uniform.fit(X, y)
+    biased.fit(X, y, sample_weight=weights)
+
+    n_class0_uniform = int((cp.asnumpy(uniform.predict(X)) == 0).sum())
+    n_class0_biased = int((cp.asnumpy(biased.predict(X)) == 0).sum())
+    # Observed: uniform=95, heavily-weighted-class-0=200 out of 200 rows.
+    assert n_class0_biased > n_class0_uniform
+
+
+@pytest.mark.parametrize(
+    "n_estimators",
+    [unit_param(30), quality_param(100)],
+)
+def test_extra_trees_classifier_held_out_sklearn_parity(n_estimators):
+    """Out-of-sample sklearn parity: train cuML and sklearn ETC on the
+    same 8000-row train fold, evaluate on the held-out 2000-row test
+    fold, demand accuracy gap below tolerance. Complements the in-sample
+    test_extra_trees_classifier_sklearn_parity_accuracy on the small
+    fixture; catches generalization-side regressions that in-sample
+    tests miss."""
+    X, y = make_classification(
+        n_samples=10000,
+        n_features=10,
+        n_informative=5,
+        n_redundant=0,
+        n_repeated=0,
+        random_state=42,
+    )
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+    cu = cuetc(
+        n_estimators=n_estimators, max_depth=12, random_state=0, n_streams=1
+    )
+    cu.fit(
+        cp.asarray(X_tr, dtype=cp.float32),
+        cp.asarray(y_tr, dtype=cp.int32),
+    )
+    sk = sketc(n_estimators=n_estimators, max_depth=12, random_state=0)
+    sk.fit(X_tr, y_tr)
+    cu_acc = accuracy_score(
+        y_te, cp.asnumpy(cu.predict(cp.asarray(X_te, dtype=cp.float32)))
+    )
+    sk_acc = accuracy_score(y_te, sk.predict(X_te))
+    # Observed delta ~0.005-0.020 across seeds; 0.07 absorbs RNG variance
+    # plus the quantile-grid divergence noted in the ETC class docstring.
+    assert abs(cu_acc - sk_acc) < 0.07
+
+
+@pytest.mark.parametrize(
+    "n_estimators",
+    [unit_param(30), quality_param(100)],
+)
+def test_extra_trees_regressor_held_out_sklearn_parity(n_estimators):
+    """Regressor variant of the held-out parity check. R² gets a slightly
+    wider band than accuracy for the same reasons documented on the
+    in-sample test_extra_trees_regressor_sklearn_parity_r2 test."""
+    X, y = make_regression(
+        n_samples=10000,
+        n_features=10,
+        n_informative=5,
+        noise=0.5,
+        random_state=42,
+    )
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+    cu = cuetr(
+        n_estimators=n_estimators, max_depth=12, random_state=0, n_streams=1
+    )
+    cu.fit(
+        cp.asarray(X_tr, dtype=cp.float32),
+        cp.asarray(y_tr, dtype=cp.float32),
+    )
+    sk = sketr(n_estimators=n_estimators, max_depth=12, random_state=0)
+    sk.fit(X_tr, y_tr)
+    cu_r2 = r2_score(
+        y_te, cp.asnumpy(cu.predict(cp.asarray(X_te, dtype=cp.float32)))
+    )
+    sk_r2 = r2_score(y_te, sk.predict(X_te))
+    # Observed delta ~0.005-0.015 across seeds; 0.10 absorbs ratio variance.
+    assert abs(cu_r2 - sk_r2) < 0.10

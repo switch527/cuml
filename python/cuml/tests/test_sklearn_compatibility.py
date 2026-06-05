@@ -15,7 +15,12 @@ from cuml.cluster import (
 )
 from cuml.covariance import EmpiricalCovariance, LedoitWolf
 from cuml.decomposition import PCA, IncrementalPCA, TruncatedSVD
-from cuml.ensemble import RandomForestClassifier, RandomForestRegressor
+from cuml.ensemble import (
+    ExtraTreesClassifier,
+    ExtraTreesRegressor,
+    RandomForestClassifier,
+    RandomForestRegressor,
+)
 from cuml.kernel_ridge import KernelRidge
 from cuml.linear_model import (
     ElasticNet,
@@ -84,6 +89,8 @@ ESTIMATORS = [
     # TODO(26.08): Remove explicit default
     RandomForestClassifier(max_depth=None),
     RandomForestRegressor(max_depth=None),
+    ExtraTreesClassifier(max_depth=None),
+    ExtraTreesRegressor(max_depth=None),
     KMeans(),
     SpectralClustering(),
     LogisticRegression(),
@@ -128,6 +135,21 @@ XFAILS = {
         "check_sample_weight_equivalence_on_dense_data": "Quantile binning means sample_weight is not equivalent to row duplication",
         "check_sample_weight_equivalence_on_sparse_data": "RandomForestClassifier does not handle sparse data",
         "check_class_weight_classifiers": "Sklearn's check sets min_weight_fraction_leaf=0.01 to force the decision boundary; cuml RandomForestClassifier omits that parameter as UnsupportedOnGPU, so the >0.87 threshold is unreachable. The class_weight machinery itself is correct (verified in test_random_forest.py::test_rfc_class_weight_matches_sklearn). Remove if cuml RFC ever supports min_weight_fraction_leaf.",
+    },
+    ExtraTreesClassifier: {
+        "check_estimator_tags_renamed": "No support for modern tags infrastructure",
+        "check_classifier_data_not_an_array": "ExtraTreesClassifier does not handle non-array data (inherited from RandomForestClassifier)",
+        "check_sample_weight_equivalence_on_dense_data": "Quantile binning means sample_weight is not equivalent to row duplication (inherited from RandomForestClassifier)",
+        "check_sample_weight_equivalence_on_sparse_data": "ExtraTreesClassifier does not handle sparse data (inherited from RandomForestClassifier)",
+        "check_class_weight_classifiers": "Inherits the RFC UnsupportedOnGPU on min_weight_fraction_leaf, so sklearn's >0.87 threshold is unreachable; class_weight itself is pinned by test_extra_trees_classifier_class_weight_runs.",
+        "check_fit2d_1sample": "SPLITTER_RANDOM requires max_n_bins >= 2; a single-sample fit produces n_bins=1 and trips the validity_check.",
+    },
+    ExtraTreesRegressor: {
+        "check_estimator_tags_renamed": "No support for modern tags infrastructure",
+        "check_regressor_data_not_an_array": "ExtraTreesRegressor does not handle non-array data (inherited from RandomForestRegressor)",
+        "check_sample_weight_equivalence_on_dense_data": "Quantile binning means sample_weight is not equivalent to row duplication (inherited from RandomForestRegressor)",
+        "check_sample_weight_equivalence_on_sparse_data": "ExtraTreesRegressor does not handle sparse data (inherited from RandomForestRegressor)",
+        "check_fit2d_1sample": "SPLITTER_RANDOM requires max_n_bins >= 2; a single-sample fit produces n_bins=1 and trips the validity_check.",
     },
     KNeighborsClassifier: {
         "check_estimator_tags_renamed": "No support for modern tags infrastructure",
